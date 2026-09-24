@@ -1,0 +1,49 @@
+# .github/workflows/project-clearance-refresh.yml
+# Metabase -> Google Sheet refresh, 4x a day (IST): ~06:00, 11:00, 16:00, 21:00
+# GitHub cron is UTC and can start 5-20 min late under load.
+name: Project Clearance Refresh
+
+on:
+  schedule:
+    - cron: "30 0 * * *"    # 06:00 IST
+    - cron: "30 5 * * *"    # 11:00 IST
+    - cron: "30 10 * * *"   # 16:00 IST
+    - cron: "30 15 * * *"   # 21:00 IST
+  workflow_dispatch: {}     # manual "Run workflow" button
+
+concurrency:
+  group: project-clearance-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install "pandas>=2.0" "requests>=2.31" "gspread>=6.0" "google-auth>=2.23"
+
+      - name: Run refresh
+        env:
+          # --- secrets (Settings > Secrets and variables > Actions > Secrets)
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          OUTPUT_SHEET_ID: ${{ secrets.OUTPUT_SHEET_ID }}
+          MASTER_SHEET_ID: ${{ secrets.MASTER_SHEET_ID }}
+          # --- variables (Settings > Secrets and variables > Actions > Variables)
+          PASS_MARK: ${{ vars.PASS_MARK }}
+          MASTER_TAB: ${{ vars.MASTER_TAB }}
+          MASTER_KEY_COL: ${{ vars.MASTER_KEY_COL }}
+          MASTER_BATCH_COL: ${{ vars.MASTER_BATCH_COL }}
+          MASTER_ACCOUNTABLE_COL: ${{ vars.MASTER_ACCOUNTABLE_COL }}
+          SS_MODULE_REGEX: ${{ vars.SS_MODULE_REGEX }}
+          SQL_MODULE_REGEX: ${{ vars.SQL_MODULE_REGEX }}
+        run: python scripts/project_clearance_refresh.py
