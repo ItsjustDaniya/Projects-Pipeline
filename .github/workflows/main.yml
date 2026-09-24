@@ -33,4 +33,4 @@ jobs:
         env:
           METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-        run: python scripts/project_clearance_refresh.py
+        run: python project_clearance_refresh.py
