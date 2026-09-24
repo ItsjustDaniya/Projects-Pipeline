@@ -12,21 +12,10 @@ Runs from GitHub Actions 4x/day. Each run:
   3. Builds tabs: Raw_SS, Raw_SQL, Both_Cleared, Batch_Summary, Groomer, Master, _Refresh_Log
   4. Overwrites those tabs in the output Google Sheet (Looker Studio reads from it).
 
-Required env (GitHub secrets):
-  METABASE_URL          e.g. https://metabase.yourco.com
+Secrets (only these two come from GitHub secrets):
   METABASE_API_KEY      Metabase API key (Admin > Settings > Authentication > API keys)
-  GCP_SA_JSON           full JSON of a Google service account key
-  OUTPUT_SHEET_ID       Sheet ID Looker Studio reads from (share it with the service account, Editor)
-  PASS_MARK             marks_obtained >= PASS_MARK counts as "cleared" (project-level marks)
-
-Optional env (GitHub variables):
-  MASTER_SHEET_ID       master data Sheet ID (share with service account, Viewer)
-  MASTER_TAB            tab name in master sheet (default "Master")
-  MASTER_KEY_COL        user-id column in master (default "User ID")
-  MASTER_BATCH_COL      batch column in master (enables Accountable-based % in Batch_Summary)
-  MASTER_ACCOUNTABLE_COL  column that is TRUE/Yes/1 for Accountable students
-  SS_MODULE_REGEX       regex on Module_name for Excel track (default "spreadsheet|excel")
-  SQL_MODULE_REGEX      regex on Module_name for SQL track   (default "sql")
+  GCP_SA_JSON           full JSON of the Google service account key
+Everything else is in the CONFIG block below.
 """
 from __future__ import annotations
 
@@ -42,6 +31,26 @@ import gspread
 import pandas as pd
 import requests
 from google.oauth2.service_account import Credentials
+
+# ============================== CONFIG ======================================
+METABASE_URL = "https://YOUR-METABASE-HOST"      # <-- EDIT: your Metabase base URL (no trailing /)
+PASS_MARK = None                                  # <-- EDIT: marks out of 10 needed to clear, e.g. 6
+
+OUTPUT_SHEET_ID = "1Vec4-7mmLqtXMz9-rTZEvIxsV3nVgjm1KVjhOH_JcCc"   # Looker Studio reads this
+MASTER_SHEET_ID = "1a6pdd4M3gKTUdRpb9HHzMAVnkrPwr-YPNwoaPT01Ghw"   # Master Data
+MASTER_TAB = "Master Data 2023-2026"             # falls back to the first tab if not found
+
+# Master columns: set exact header names, or leave None to auto-detect from the candidates
+MASTER_KEY_COL = None          # student id column
+MASTER_BATCH_COL = None        # batch column
+MASTER_ACCOUNTABLE_COL = None  # TRUE/Yes/1 = Accountable student
+MASTER_KEY_CANDIDATES = ["user_id", "userid", "student_id", "uid", "id"]
+MASTER_BATCH_CANDIDATES = ["batch", "batch_name", "au_batch", "course", "course_title"]
+MASTER_ACCOUNTABLE_CANDIDATES = ["accountable", "is_accountable", "accountable_flag"]
+
+SS_MODULE_REGEX = r"spreadsheet|excel"   # DS 02 Spreadsheets
+SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
+# ===========================================================================
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CARDS = {"project_v1": 6241, "project_v2": 6959, "project_random": 6579, "groomer": 7577}
@@ -100,7 +109,12 @@ def gsheet_client(sa_json: str) -> gspread.Client:
 
 
 def read_master(gc: gspread.Client, sheet_id: str, tab: str) -> pd.DataFrame:
-    ws = gc.open_by_key(sheet_id).worksheet(tab)
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = sh.get_worksheet(0)
+        log(f"Master tab '{tab}' not found; using first tab '{ws.title}'")
     rows = ws.get_all_values()
     if not rows:
         return pd.DataFrame()
@@ -293,21 +307,35 @@ def build_batch_summary(df: pd.DataFrame, master: pd.DataFrame, batch_col: str |
 
 
 # --------------------------------------------------------------------------- Main
+def pick_col(cols, explicit, candidates, label):
+    if explicit:
+        c = norm_col(explicit)
+        if c not in cols:
+            log(f"WARNING: master column '{explicit}' ({label}) not found in {list(cols)[:20]}")
+            return None
+        return c
+    for cand in candidates:
+        if cand in cols:
+            log(f"Master {label} column auto-detected: '{cand}'")
+            return cand
+    log(f"Master {label} column not found (set MASTER_{label.upper()}_COL). Columns: {list(cols)[:20]}")
+    return None
+
+
 def main() -> int:
     env = os.environ
-    for k in ["METABASE_URL", "METABASE_API_KEY", "GCP_SA_JSON", "OUTPUT_SHEET_ID", "PASS_MARK"]:
+    for k in ["METABASE_API_KEY", "GCP_SA_JSON"]:
         if not env.get(k):
-            log(f"Missing required env var: {k}")
+            log(f"Missing required secret: {k}")
             return 1
+    if "YOUR-METABASE-HOST" in METABASE_URL or PASS_MARK is None:
+        log("Edit METABASE_URL and PASS_MARK in the CONFIG block first.")
+        return 1
 
     now = datetime.now(IST)
-    mb_url, mb_key = env["METABASE_URL"].rstrip("/"), env["METABASE_API_KEY"]
-    pass_mark = float(env["PASS_MARK"])
-    ss_re = env.get("SS_MODULE_REGEX") or r"spreadsheet|excel"
-    sql_re = env.get("SQL_MODULE_REGEX") or r"sql"
-    key_col = norm_col(env.get("MASTER_KEY_COL") or "User ID")
-    batch_col = norm_col(env["MASTER_BATCH_COL"]) if env.get("MASTER_BATCH_COL") else None
-    acc_col = norm_col(env["MASTER_ACCOUNTABLE_COL"]) if env.get("MASTER_ACCOUNTABLE_COL") else None
+    mb_url, mb_key = METABASE_URL.rstrip("/"), env["METABASE_API_KEY"]
+    pass_mark = float(PASS_MARK)
+    ss_re, sql_re = SS_MODULE_REGEX, SQL_MODULE_REGEX
 
     gc = gsheet_client(env["GCP_SA_JSON"])
 
@@ -315,8 +343,11 @@ def main() -> int:
     v2 = fetch_card(mb_url, mb_key, CARDS["project_v2"])
     vr = fetch_card(mb_url, mb_key, CARDS["project_random"])
     groomer = fetch_card(mb_url, mb_key, CARDS["groomer"])
-    master = (read_master(gc, env["MASTER_SHEET_ID"], env.get("MASTER_TAB") or "Master")
-              if env.get("MASTER_SHEET_ID") else pd.DataFrame())
+    master = read_master(gc, MASTER_SHEET_ID, MASTER_TAB) if MASTER_SHEET_ID else pd.DataFrame()
+    cols = set(master.columns)
+    key_col = pick_col(cols, MASTER_KEY_COL, MASTER_KEY_CANDIDATES, "key") or "user_id"
+    batch_col = pick_col(cols, MASTER_BATCH_COL, MASTER_BATCH_CANDIDATES, "batch")
+    acc_col = pick_col(cols, MASTER_ACCOUNTABLE_COL, MASTER_ACCOUNTABLE_CANDIDATES, "accountable")
 
     projects = build_projects(v1, v2, vr, pass_mark, ss_re, sql_re)
     other = projects[projects["track"] == "Other"]["module_name"].dropna().unique()
@@ -337,7 +368,7 @@ def main() -> int:
     if not master.empty:
         tabs["Master"] = master
 
-    sh = gc.open_by_key(env["OUTPUT_SHEET_ID"])
+    sh = gc.open_by_key(OUTPUT_SHEET_ID)
     for title, df in tabs.items():
         write_tab(sh, title, df)
 
