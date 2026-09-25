@@ -35,8 +35,8 @@ import requests
 from google.oauth2.service_account import Credentials
 
 # ============================== CONFIG ======================================
-METABASE_URL = "https://YOUR-METABASE-HOST"      # <-- EDIT: your Metabase base URL (no trailing /)
-PASS_MARK = None                                  # <-- EDIT: marks out of 10 needed to clear, e.g. 6
+METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co/"      # <-- EDIT: your Metabase base URL (no trailing /)
+PASS_MARK = 8                                 # <-- EDIT: marks out of 10 needed to clear, e.g. 6
 
 OUTPUT_SHEET_ID = "1Vec4-7mmLqtXMz9-rTZEvIxsV3nVgjm1KVjhOH_JcCc"   # Looker Studio reads this
 MASTER_SHEET_ID = "1a6pdd4M3gKTUdRpb9HHzMAVnkrPwr-YPNwoaPT01Ghw"   # Master Data
