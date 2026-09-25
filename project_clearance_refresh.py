@@ -9,7 +9,9 @@ Runs from GitHub Actions 4x/day. Each run:
        #6579 submission vs evaluations - 2 (random-question projects: ALL 2026 batches)
        #7577 Placement_grooming_sessions ("groomer")
   2. Reads the student master data from a Google Sheet.
-  3. Builds tabs: Raw_SS, Raw_SQL, Both_Cleared, Batch_Summary, Groomer, Master, _Refresh_Log
+  3. Builds tabs: Raw_SS, Raw_SQL, Both_Cleared, Batch_Summary, Groomer, Master, _Refresh_Log,
+     Tracker_Raw_SS + Tracker_Raw_SQL (exact A:S layout of the tracker's "Raw - SS" / "Raw -SQL",
+     built from #6242 + #6241 + live batch roster; imported into the tracker via IMPORTRANGE)
   4. Overwrites those tabs in the output Google Sheet (Looker Studio reads from it).
 
 Secrets (only these two come from GitHub secrets):
@@ -33,8 +35,8 @@ import requests
 from google.oauth2.service_account import Credentials
 
 # ============================== CONFIG ======================================
-METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co/"      # <-- EDIT: your Metabase base URL (no trailing /)
-PASS_MARK = 8                                 # <-- EDIT: marks out of 10 needed to clear, e.g. 6
+METABASE_URL = "https://YOUR-METABASE-HOST"      # <-- EDIT: your Metabase base URL (no trailing /)
+PASS_MARK = None                                  # <-- EDIT: marks out of 10 needed to clear, e.g. 6
 
 OUTPUT_SHEET_ID = "1Vec4-7mmLqtXMz9-rTZEvIxsV3nVgjm1KVjhOH_JcCc"   # Looker Studio reads this
 MASTER_SHEET_ID = "1a6pdd4M3gKTUdRpb9HHzMAVnkrPwr-YPNwoaPT01Ghw"   # Master Data
@@ -48,12 +50,22 @@ MASTER_KEY_CANDIDATES = ["user_id", "userid", "student_id", "uid", "id"]
 MASTER_BATCH_CANDIDATES = ["batch", "batch_name", "au_batch", "course", "course_title"]
 MASTER_ACCOUNTABLE_CANDIDATES = ["accountable", "is_accountable", "accountable_flag"]
 
+# ---- Tracker feed (Project_Clearance_Tracker "Raw - SS" / "Raw -SQL" columns A:S) ----
+TRACKER_PASS_MARK = 8                    # Clearance = "Cleared" when marks_obtained >= 8 (matches tracker)
+TRACKER_MIN_COURSE_START = "2025-01-01"  # batches starting on/after this date
+TRACKER_SS_STRUCTURES = (50, 193)        # Spreadsheets batch course structures (roster)
+TRACKER_SQL_STRUCTURES = (52,)           # SQL batch course structures (roster)
+TRACKER_SS_MODULE = "DS 02 Spreadsheets"
+TRACKER_SQL_MODULE = "DS 04 SQL"
+
 SS_MODULE_REGEX = r"spreadsheet|excel"   # DS 02 Spreadsheets
 SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
 # ===========================================================================
 
 IST = timezone(timedelta(hours=5, minutes=30))
-CARDS = {"project_v1": 6241, "project_v2": 6959, "project_random": 6579, "groomer": 7577}
+CARDS = {"project_v1": 6241, "project_v2": 6959, "project_random": 6579, "groomer": 7577,
+         "tracker_random": 6242}
+METABASE_DB_ID = 4  # Newton School
 WEEK_CHECKPOINTS = range(0, 9)    # W0..W8 (W0 = at 1st-submission deadline)
 MONTH_CHECKPOINTS = range(1, 7)   # M1..M6 after deadline
 WRITE_CHUNK_ROWS = 5000
@@ -96,6 +108,54 @@ def fetch_card(base_url: str, api_key: str, card_id: int, retries: int = 3) -> p
             log(f"  failed: {e}")
             time.sleep(30 * attempt)
     raise RuntimeError(f"Card #{card_id} failed after {retries} attempts: {last_err}")
+
+
+def fetch_native(base_url: str, api_key: str, sql: str, label: str, retries: int = 3) -> pd.DataFrame:
+    """Run an ad-hoc native SQL query through Metabase and return it as a DataFrame."""
+    query = {"database": METABASE_DB_ID, "type": "native", "native": {"query": sql}}
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            log(f"Metabase native '{label}': attempt {attempt}")
+            r = requests.post(f"{base_url}/api/dataset/csv", headers={"x-api-key": api_key},
+                              data={"query": json.dumps(query), "format_rows": "false"}, timeout=1200)
+            r.raise_for_status()
+            body = r.content.decode("utf-8-sig")
+            if body.lstrip().startswith("{") and '"error"' in body[:2000]:
+                raise RuntimeError(f"Query error: {body[:500]}")
+            df = pd.read_csv(io.StringIO(body), low_memory=False)
+            df.columns = [norm_col(c) for c in df.columns]
+            log(f"Metabase native '{label}': {len(df):,} rows")
+            return df
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log(f"  failed: {e}")
+            time.sleep(30 * attempt)
+    raise RuntimeError(f"Native query '{label}' failed after {retries} attempts: {last_err}")
+
+
+ROSTER_SQL = """
+with refund as (
+    select distinct ccum.id as lu_cum_id
+    from courses_courseusermapping au
+    join courses_courseuserlabelmapping l on l.course_user_mapping_id = au.id and l.label_id = 677
+    join courses_courseusermapping ccum on ccum.admin_course_user_mapping_id = au.id
+)
+select distinct
+    cc.title as batch,
+    cc.course_structure_id,
+    date(cc.start_timestamp) as course_start,
+    cum.user_id,
+    concat(au.first_name, ' ', au.last_name) as name
+from courses_courseusermapping cum
+join courses_course cc on cc.id = cum.course_id
+join auth_user au on au.id = cum.user_id
+where cum.status = 8
+  and cc.course_structure_id in ({structures})
+  and cc.start_timestamp >= '{min_start}'
+  and cc.title not in ('Spreadsheets (T)')
+  and cum.id not in (select lu_cum_id from refund)
+"""
 
 
 # --------------------------------------------------------------------------- Google Sheets
@@ -239,6 +299,88 @@ def build_projects(v1: pd.DataFrame, v2: pd.DataFrame, vr: pd.DataFrame, pass_ma
     return df
 
 
+TRACKER_HEADERS = [
+    "Batch", "user_id", "Name", "Module_name", "project_release_date", "Project", "question_title",
+    "project_deadline_date", "Submission Status", "Submission Time", "Evaluation Status",
+    "first_feedback_given_time", "latest_feedback_given_time", "feedback_received_count",
+    "number_of_submissions", "marks_obtained", "Submission Time 1", "Clearance", "re_evaluation_flag",
+]
+
+
+def _fmt_ts(s: pd.Series) -> pd.Series:
+    return _ts(s).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_date(s: pd.Series) -> pd.Series:
+    d = pd.to_datetime(s, errors="coerce")
+    if d.dt.tz is not None:
+        d = d.dt.tz_convert(IST).dt.tz_localize(None)
+    return d.dt.strftime("%Y-%m-%d")
+
+
+def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
+                      roster: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Rebuild the tracker's Raw - SS / Raw -SQL (cols A:S): one row per student x project
+    from #6242 (random-question projects) + #6241 (fixed-question projects), plus 'null' rows
+    for roster students in batches whose project has not been released yet."""
+    proj = pd.concat([random_df, fixed_df], ignore_index=True, sort=False)
+    proj = proj[proj["module_name"].isin([TRACKER_SS_MODULE, TRACKER_SQL_MODULE])].copy()
+    rel = pd.to_datetime(proj["project_release_date"], errors="coerce")
+    if rel.dt.tz is not None:
+        rel = rel.dt.tz_localize(None)
+    course_start = roster.drop_duplicates("batch").set_index("batch")["course_start"]
+    known = proj["batch"].map(pd.to_datetime(course_start, errors="coerce"))
+    keep = known.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)) | (known.isna() & rel.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)))
+    proj = proj[keep]
+    proj = proj.drop_duplicates(subset=["user_id", "batch", "project", "question_id"], keep="first")
+
+    marks = pd.to_numeric(proj["marks_obtained"], errors="coerce")
+    fb_cnt = pd.to_numeric(proj["feedback_received_count"], errors="coerce").fillna(0)
+    sub_t, last_fb = _ts(proj["submission_time"]), _ts(proj["latest_feedback_given_time"])
+    submitted = proj["submission_status"].eq("Submitted") & sub_t.notna()
+    reeval = pd.Series(0, index=proj.index)
+    reeval[(fb_cnt > 0) & sub_t.notna() & last_fb.notna() & (sub_t > last_fb)] = 1
+    reeval[submitted & (fb_cnt == 0)] = 2
+
+    out = pd.DataFrame({
+        "Batch": proj["batch"],
+        "user_id": pd.to_numeric(proj["user_id"], errors="coerce").astype("Int64"),
+        "Name": proj["name"],
+        "Module_name": proj["module_name"],
+        "project_release_date": _fmt_date(proj["project_release_date"]),
+        "Project": proj["project"],
+        "question_title": proj["question_title"],
+        "project_deadline_date": _fmt_date(proj["project_deadline_date"]),
+        "Submission Status": proj["submission_status"],
+        "Submission Time": sub_t.dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "Evaluation Status": proj["evaluation_status"],
+        "first_feedback_given_time": _fmt_ts(proj["first_feedback_given_time"]),
+        "latest_feedback_given_time": last_fb.dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "feedback_received_count": fb_cnt.astype(int),
+        "number_of_submissions": pd.to_numeric(proj["number_of_submissions"], errors="coerce").fillna(0).astype(int),
+        "marks_obtained": marks,
+        "Submission Time 1": _fmt_date(proj["submission_time_1"]),
+        "Clearance": marks.ge(TRACKER_PASS_MARK).map({True: "Cleared", False: "Not Cleared"}),
+        "re_evaluation_flag": reeval.astype(int),
+    })
+
+    # 'null' rows: roster students of batches that have no project rows yet
+    r = roster.copy()
+    r["Module_name"] = r["course_structure_id"].map(
+        lambda cs: TRACKER_SS_MODULE if cs in TRACKER_SS_STRUCTURES else TRACKER_SQL_MODULE)
+    r = r[~r["batch"].isin(set(out["Batch"]))]
+    nulls = pd.DataFrame({h: "null" for h in TRACKER_HEADERS}, index=r.index)
+    nulls["Batch"], nulls["user_id"], nulls["Name"] = r["batch"], pd.to_numeric(r["user_id"]).astype("Int64"), r["name"]
+    nulls["Module_name"], nulls["Clearance"], nulls["re_evaluation_flag"] = r["Module_name"], "Not Cleared", 0
+    full = pd.concat([out, nulls], ignore_index=True)
+    full = full.astype(object).where(full.notna(), "null")
+    full = full.sort_values(["Batch", "user_id"], kind="stable")
+    return {
+        "Tracker_Raw_SS": full[full["Module_name"] == TRACKER_SS_MODULE][TRACKER_HEADERS],
+        "Tracker_Raw_SQL": full[full["Module_name"] == TRACKER_SQL_MODULE][TRACKER_HEADERS],
+    }
+
+
 def attach_master(df: pd.DataFrame, master: pd.DataFrame, key_col: str) -> pd.DataFrame:
     if master.empty or key_col not in master.columns:
         return df
@@ -342,6 +484,10 @@ def main() -> int:
     v1 = fetch_card(mb_url, mb_key, CARDS["project_v1"])
     v2 = fetch_card(mb_url, mb_key, CARDS["project_v2"])
     vr = fetch_card(mb_url, mb_key, CARDS["project_random"])
+    tr = fetch_card(mb_url, mb_key, CARDS["tracker_random"])
+    structures = ",".join(str(x) for x in (*TRACKER_SS_STRUCTURES, *TRACKER_SQL_STRUCTURES))
+    roster = fetch_native(mb_url, mb_key, ROSTER_SQL.format(structures=structures,
+                          min_start=TRACKER_MIN_COURSE_START), "batch roster")
     groomer = fetch_card(mb_url, mb_key, CARDS["groomer"])
     master = read_master(gc, MASTER_SHEET_ID, MASTER_TAB) if MASTER_SHEET_ID else pd.DataFrame()
     cols = set(master.columns)
@@ -367,6 +513,7 @@ def main() -> int:
     }
     if not master.empty:
         tabs["Master"] = master
+    tabs.update(build_tracker_raw(tr, v1, roster))
 
     sh = gc.open_by_key(OUTPUT_SHEET_ID)
     for title, df in tabs.items():
