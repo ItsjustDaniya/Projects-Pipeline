@@ -35,8 +35,8 @@ import requests
 from google.oauth2.service_account import Credentials
 
 # ============================== CONFIG ======================================
-METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co/"      # <-- EDIT: your Metabase base URL (no trailing /)
-PASS_MARK = 8                                 # <-- EDIT: marks out of 10 needed to clear, e.g. 6
+METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+PASS_MARK = 8                                     # marks out of 10 needed to clear (tracker rule: >= 8)
 
 OUTPUT_SHEET_ID = "1Vec4-7mmLqtXMz9-rTZEvIxsV3nVgjm1KVjhOH_JcCc"   # Looker Studio reads this
 MASTER_SHEET_ID = "1a6pdd4M3gKTUdRpb9HHzMAVnkrPwr-YPNwoaPT01Ghw"   # Master Data
@@ -57,6 +57,10 @@ TRACKER_SS_STRUCTURES = (50, 193)        # Spreadsheets batch course structures 
 TRACKER_SQL_STRUCTURES = (52,)           # SQL batch course structures (roster)
 TRACKER_SS_MODULE = "DS 02 Spreadsheets"
 TRACKER_SQL_MODULE = "DS 04 SQL"
+# Saved Metabase question with the batch roster SQL (see ROSTER_SQL below). The API key can run
+# saved questions but not ad-hoc SQL, so paste ROSTER_SQL into a new native question, save it,
+# and put its ID here. None = skip roster ('null' rows for not-yet-released batches are omitted).
+TRACKER_ROSTER_CARD_ID = 13022   # "PC - Batch Roster"
 
 SS_MODULE_REGEX = r"spreadsheet|excel"   # DS 02 Spreadsheets
 SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
@@ -65,7 +69,6 @@ SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
 IST = timezone(timedelta(hours=5, minutes=30))
 CARDS = {"project_v1": 6241, "project_v2": 6959, "project_random": 6579, "groomer": 7577,
          "tracker_random": 6242}
-METABASE_DB_ID = 4  # Newton School
 WEEK_CHECKPOINTS = range(0, 9)    # W0..W8 (W0 = at 1st-submission deadline)
 MONTH_CHECKPOINTS = range(1, 7)   # M1..M6 after deadline
 WRITE_CHUNK_ROWS = 5000
@@ -110,30 +113,6 @@ def fetch_card(base_url: str, api_key: str, card_id: int, retries: int = 3) -> p
     raise RuntimeError(f"Card #{card_id} failed after {retries} attempts: {last_err}")
 
 
-def fetch_native(base_url: str, api_key: str, sql: str, label: str, retries: int = 3) -> pd.DataFrame:
-    """Run an ad-hoc native SQL query through Metabase and return it as a DataFrame."""
-    query = {"database": METABASE_DB_ID, "type": "native", "native": {"query": sql}}
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            log(f"Metabase native '{label}': attempt {attempt}")
-            r = requests.post(f"{base_url}/api/dataset/csv", headers={"x-api-key": api_key},
-                              data={"query": json.dumps(query), "format_rows": "false"}, timeout=1200)
-            r.raise_for_status()
-            body = r.content.decode("utf-8-sig")
-            if body.lstrip().startswith("{") and '"error"' in body[:2000]:
-                raise RuntimeError(f"Query error: {body[:500]}")
-            df = pd.read_csv(io.StringIO(body), low_memory=False)
-            df.columns = [norm_col(c) for c in df.columns]
-            log(f"Metabase native '{label}': {len(df):,} rows")
-            return df
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            log(f"  failed: {e}")
-            time.sleep(30 * attempt)
-    raise RuntimeError(f"Native query '{label}' failed after {retries} attempts: {last_err}")
-
-
 ROSTER_SQL = """
 with refund as (
     select distinct ccum.id as lu_cum_id
@@ -151,8 +130,8 @@ from courses_courseusermapping cum
 join courses_course cc on cc.id = cum.course_id
 join auth_user au on au.id = cum.user_id
 where cum.status = 8
-  and cc.course_structure_id in ({structures})
-  and cc.start_timestamp >= '{min_start}'
+  and cc.course_structure_id in (50, 193, 52)
+  and cc.start_timestamp >= '2025-01-01'
   and cc.title not in ('Spreadsheets (T)')
   and cum.id not in (select lu_cum_id from refund)
 """
@@ -328,8 +307,9 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
     rel = pd.to_datetime(proj["project_release_date"], errors="coerce")
     if rel.dt.tz is not None:
         rel = rel.dt.tz_localize(None)
-    course_start = roster.drop_duplicates("batch").set_index("batch")["course_start"]
-    known = proj["batch"].map(pd.to_datetime(course_start, errors="coerce"))
+    starts = {b: pd.to_datetime(d, errors="coerce")
+              for b, d in roster.drop_duplicates("batch")[["batch", "course_start"]].itertuples(index=False)}
+    known = pd.to_datetime(proj["batch"].map(starts), errors="coerce")
     keep = known.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)) | (known.isna() & rel.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)))
     proj = proj[keep]
     proj = proj.drop_duplicates(subset=["user_id", "batch", "project", "question_id"], keep="first")
@@ -470,9 +450,6 @@ def main() -> int:
         if not env.get(k):
             log(f"Missing required secret: {k}")
             return 1
-    if "YOUR-METABASE-HOST" in METABASE_URL or PASS_MARK is None:
-        log("Edit METABASE_URL and PASS_MARK in the CONFIG block first.")
-        return 1
 
     now = datetime.now(IST)
     mb_url, mb_key = METABASE_URL.rstrip("/"), env["METABASE_API_KEY"]
@@ -485,9 +462,17 @@ def main() -> int:
     v2 = fetch_card(mb_url, mb_key, CARDS["project_v2"])
     vr = fetch_card(mb_url, mb_key, CARDS["project_random"])
     tr = fetch_card(mb_url, mb_key, CARDS["tracker_random"])
-    structures = ",".join(str(x) for x in (*TRACKER_SS_STRUCTURES, *TRACKER_SQL_STRUCTURES))
-    roster = fetch_native(mb_url, mb_key, ROSTER_SQL.format(structures=structures,
-                          min_start=TRACKER_MIN_COURSE_START), "batch roster")
+    if TRACKER_ROSTER_CARD_ID:
+        try:
+            roster = fetch_card(mb_url, mb_key, int(TRACKER_ROSTER_CARD_ID))
+        except Exception as e:  # noqa: BLE001
+            log(f"WARNING: roster card failed, continuing without it: {e}")
+            roster = pd.DataFrame()
+    else:
+        log("NOTE: TRACKER_ROSTER_CARD_ID not set - skipping 'null' rows for unreleased batches")
+        roster = pd.DataFrame()
+    if roster.empty:
+        roster = pd.DataFrame(columns=["batch", "course_structure_id", "course_start", "user_id", "name"])
     groomer = fetch_card(mb_url, mb_key, CARDS["groomer"])
     master = read_master(gc, MASTER_SHEET_ID, MASTER_TAB) if MASTER_SHEET_ID else pd.DataFrame()
     cols = set(master.columns)
