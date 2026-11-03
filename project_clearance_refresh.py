@@ -34,6 +34,8 @@ import pandas as pd
 import requests
 from google.oauth2.service_account import Credentials
 
+import tracker_helpers as th
+
 # ============================== CONFIG ======================================
 METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co"
 PASS_MARK = 8                                     # marks out of 10 needed to clear (tracker rule: >= 8)
@@ -61,6 +63,22 @@ TRACKER_SQL_MODULE = "DS 04 SQL"
 # saved questions but not ad-hoc SQL, so paste ROSTER_SQL into a new native question, save it,
 # and put its ID here. None = skip roster ('null' rows for not-yet-released batches are omitted).
 TRACKER_ROSTER_CARD_ID = 13022   # "PC - Batch Roster"
+
+# ---- Tracker helper columns (Raw - SS T:AR, Raw -SQL T:AP) -- see tracker_helpers.py ----
+# When True, Tracker_Raw_SS / Tracker_Raw_SQL also carry the columns the tracker used to compute
+# with hand-dragged formulas, so its IMPORTRANGE can be widened to A1:AR / A1:AP.
+# Turn on only after TRACKER_LOOKUPS_CARD_ID is set.
+TRACKER_HELPER_COLS = True
+# Saved question with sql/tracker_student_lookups.sql (30-day activity + Acad Interview persona)
+TRACKER_LOOKUPS_CARD_ID = 13684
+# "latest_evaluated" reproduces the tracker's numbers today; "first" uses each student's real first
+# submission, which is what the "1st Submission" tab was meant to hold. See tracker_helpers.py.
+FIRST_SUBMISSION_RULE = "latest_evaluated"
+FLYWHEEL_SHEET_ID = "1Ue49enEEpgNaOEdQVgwgsehWvHb3HEI0Q-qekvAzYyU"   # Placements - FlyWheel
+FLYWHEEL_PLACEMENT_TAB = "Prog<>Placement"
+FLYWHEEL_BIBLE_TAB = "All Bible"
+SUBMISSIONS_RANKED_SHEET_ID = "1CbJL4twtn38a8FbFkkXxZ_HNXFStlgwqLPdPQgwY5zI"  # Projects---Daily-Update
+SUBMISSIONS_RANKED_TAB = "submissions_ranked"
 
 SS_MODULE_REGEX = r"spreadsheet|excel"   # DS 02 Spreadsheets
 SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
@@ -164,17 +182,18 @@ def read_master(gc: gspread.Client, sheet_id: str, tab: str) -> pd.DataFrame:
     return df
 
 
-def to_values(df: pd.DataFrame) -> list[list]:
+def to_values(df: pd.DataFrame, headers: list[str] | None = None) -> list[list]:
     out = df.copy()
     for c in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[c]):
             out[c] = out[c].dt.strftime("%Y-%m-%d %H:%M:%S")
     out = out.astype(object).where(pd.notna(out), "")
-    return [list(out.columns)] + out.values.tolist()
+    return [list(headers) if headers else list(out.columns)] + out.values.tolist()
 
 
-def write_tab(sh: gspread.Spreadsheet, title: str, df: pd.DataFrame) -> None:
-    values = to_values(df)
+def write_tab(sh: gspread.Spreadsheet, title: str, df: pd.DataFrame,
+              headers: list[str] | None = None) -> None:
+    values = to_values(df, headers)
     n_rows, n_cols = len(values), max(len(values[0]), 1)
     if n_rows * n_cols > SHEET_CELL_LIMIT * 0.9:
         log(f"WARNING: {title} is {n_rows*n_cols:,} cells, close to the 10M Sheets limit")
@@ -428,6 +447,53 @@ def build_batch_summary(df: pd.DataFrame, master: pd.DataFrame, batch_col: str |
     return summary
 
 
+# --------------------------------------------------------------------------- Tracker helper columns
+def _open_or_explain(gc: gspread.Client, sheet_id: str, sa_email: str) -> gspread.Spreadsheet:
+    try:
+        return gc.open_by_key(sheet_id)
+    except (gspread.SpreadsheetNotFound, gspread.exceptions.APIError) as e:
+        raise RuntimeError(f"Cannot open sheet {sheet_id}. Share it (Viewer is enough) with the "
+                           f"service account {sa_email}. ({e})") from e
+
+
+def load_tracker_lookups(gc: gspread.Client, sa_email: str, mb_url: str, mb_key: str) -> th.Lookups:
+    """Everything the Raw - SS / Raw -SQL helper formulas looked up, from its real source."""
+    if not TRACKER_LOOKUPS_CARD_ID:
+        raise RuntimeError("TRACKER_HELPER_COLS is on but TRACKER_LOOKUPS_CARD_ID is not set")
+    activity, persona_ss = th.student_lookups_from_card(
+        fetch_card(mb_url, mb_key, int(TRACKER_LOOKUPS_CARD_ID)))
+    log(f"Lookups card: {len(activity):,} students, {sum(v == 'Yes' for v in activity.values()):,} "
+        f"active in 30 days, {len(persona_ss):,} with persona")
+
+    fly = _open_or_explain(gc, FLYWHEEL_SHEET_ID, sa_email)
+    placement = th.placement_lookup(fly.worksheet(FLYWHEEL_PLACEMENT_TAB).get("A:T"))
+    persona_sql = th.persona_lookup(fly.worksheet(FLYWHEEL_BIBLE_TAB).get("A:F"))
+    log(f"FlyWheel: {len(placement):,} placement rows, {len(persona_sql):,} All Bible personas")
+
+    ranked = _open_or_explain(gc, SUBMISSIONS_RANKED_SHEET_ID, sa_email) \
+        .worksheet(SUBMISSIONS_RANKED_TAB).get_all_values()
+    first_ss = th.first_submission_lookup(ranked, TRACKER_SS_MODULE, FIRST_SUBMISSION_RULE)
+    first_sql = th.first_submission_lookup(ranked, TRACKER_SQL_MODULE, FIRST_SUBMISSION_RULE)
+    log(f"submissions_ranked ({FIRST_SUBMISSION_RULE}): {len(first_ss):,} SS / {len(first_sql):,} SQL students")
+    for name, d in [("activity", activity), ("placement", placement), ("submissions_ranked SS", first_ss)]:
+        if not d:
+            raise RuntimeError(f"{name} lookup came back empty - refusing to blank the tracker columns")
+    return th.Lookups(activity30=activity, placement=placement, persona_ss=persona_ss,
+                      persona_sql=persona_sql, first_sub_ss=first_ss, first_sub_sql=first_sql)
+
+
+def add_tracker_helpers(tracker_tabs: dict[str, pd.DataFrame], lk: th.Lookups,
+                        today) -> dict[str, tuple[pd.DataFrame, list[str]]]:
+    """Tracker_Raw_SS -> A:AR, Tracker_Raw_SQL -> A:AP (data frame + exact header row)."""
+    out = {}
+    for title, builder, hdr in [("Tracker_Raw_SS", th.build_ss_helpers, th.SS_HELPER_HEADERS),
+                                ("Tracker_Raw_SQL", th.build_sql_helpers, th.SQL_HELPER_HEADERS)]:
+        base = tracker_tabs[title].reset_index(drop=True)
+        helpers = builder(base, lk, today).reset_index(drop=True)
+        out[title] = (pd.concat([base, helpers], axis=1), TRACKER_HEADERS + hdr)
+    return out
+
+
 # --------------------------------------------------------------------------- Main
 def pick_col(cols, explicit, candidates, label):
     if explicit:
@@ -498,11 +564,29 @@ def main() -> int:
     }
     if not master.empty:
         tabs["Master"] = master
-    tabs.update(build_tracker_raw(tr, v1, roster))
+    tracker_tabs = build_tracker_raw(tr, v1, roster)
+    tabs.update(tracker_tabs)
+
+    # Helper columns: if any lookup fails, leave the tracker tabs exactly as the last good run
+    # wrote them (the tracker imports them), write everything else, and fail the run at the end.
+    headers: dict[str, list[str]] = {}
+    helper_error = None
+    if TRACKER_HELPER_COLS:
+        try:
+            sa_email = json.loads(env["GCP_SA_JSON"]).get("client_email", "?")
+            lk = load_tracker_lookups(gc, sa_email, mb_url, mb_key)
+            for title, (df, hdr) in add_tracker_helpers(tracker_tabs, lk, now.date()).items():
+                tabs[title], headers[title] = df, hdr
+        except Exception as e:  # noqa: BLE001
+            helper_error = e
+            log(f"ERROR building tracker helper columns: {e}")
+            log("Skipping Tracker_Raw_SS / Tracker_Raw_SQL this run so the tracker keeps the last good data")
+            for title in tracker_tabs:
+                tabs.pop(title, None)
 
     sh = gc.open_by_key(OUTPUT_SHEET_ID)
     for title, df in tabs.items():
-        write_tab(sh, title, df)
+        write_tab(sh, title, df, headers.get(title))
 
     # Append-only run log (Looker can show "last refreshed")
     try:
@@ -512,6 +596,9 @@ def main() -> int:
         log_ws.update(range_name="A1", values=[["refreshed_at_ist", *tabs.keys()]])
     log_ws.append_row([now.strftime("%Y-%m-%d %H:%M:%S"), *[len(d) for d in tabs.values()]],
                       value_input_option="RAW")
+    if helper_error is not None:
+        log("Done, but tracker helper columns FAILED (see error above) - exiting non-zero.")
+        return 1
     log("Done.")
     return 0
 
