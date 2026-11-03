@@ -581,20 +581,22 @@ def main() -> int:
             helper_error = e
             log(f"ERROR building tracker helper columns: {e}")
             log("Skipping Tracker_Raw_SS / Tracker_Raw_SQL this run so the tracker keeps the last good data")
-            for title in tracker_tabs:
-                tabs.pop(title, None)
+    skipped = set(tracker_tabs) if helper_error is not None else set()
 
     sh = gc.open_by_key(OUTPUT_SHEET_ID)
     for title, df in tabs.items():
-        write_tab(sh, title, df, headers.get(title))
+        if title not in skipped:
+            write_tab(sh, title, df, headers.get(title))
 
-    # Append-only run log (Looker can show "last refreshed")
+    # Append-only run log (Looker can show "last refreshed"); skipped tabs log "skipped" so the
+    # columns stay aligned with the header row.
     try:
         log_ws = sh.worksheet("_Refresh_Log")
     except gspread.WorksheetNotFound:
         log_ws = sh.add_worksheet(title="_Refresh_Log", rows=2, cols=len(tabs) + 1)
         log_ws.update(range_name="A1", values=[["refreshed_at_ist", *tabs.keys()]])
-    log_ws.append_row([now.strftime("%Y-%m-%d %H:%M:%S"), *[len(d) for d in tabs.values()]],
+    log_ws.append_row([now.strftime("%Y-%m-%d %H:%M:%S"),
+                       *["skipped" if t in skipped else len(d) for t, d in tabs.items()]],
                       value_input_option="RAW")
     if helper_error is not None:
         log("Done, but tracker helper columns FAILED (see error above) - exiting non-zero.")
