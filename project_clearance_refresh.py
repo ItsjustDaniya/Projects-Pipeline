@@ -68,9 +68,9 @@ TRACKER_ROSTER_CARD_ID = 13022   # "PC - Batch Roster"
 # When True, Tracker_Raw_SS / Tracker_Raw_SQL also carry the columns the tracker used to compute
 # with hand-dragged formulas, so its IMPORTRANGE can be widened to A1:AR / A1:AP.
 # Turn on only after TRACKER_LOOKUPS_CARD_ID is set.
-TRACKER_HELPER_COLS = False
+TRACKER_HELPER_COLS = True
 # Saved question with sql/tracker_student_lookups.sql (30-day activity + Acad Interview persona)
-TRACKER_LOOKUPS_CARD_ID = None
+TRACKER_LOOKUPS_CARD_ID = 13684
 # "latest_evaluated" reproduces the tracker's numbers today; "first" uses each student's real first
 # submission, which is what the "1st Submission" tab was meant to hold. See tracker_helpers.py.
 FIRST_SUBMISSION_RULE = "latest_evaluated"
