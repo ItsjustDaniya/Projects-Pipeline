@@ -217,6 +217,7 @@ def collapse_random(sub: pd.DataFrame, pass_mark: float) -> pd.DataFrame:
     s["_sub_marks"] = pd.to_numeric(s.get("marks_submission_level"), errors="coerce")
     s["_pass_t"] = s["_fb_t"].where(s["_sub_marks"].ge(pass_mark))
     key = ["user_id", "batch", "project", "question_id"]
+    s = s.sort_values(["_sub_t", "_fb_t"], na_position="first", kind="stable")
     g = s.groupby(key, dropna=False)
     out = g.agg(
         name=("student_name", "first"),
@@ -226,7 +227,7 @@ def collapse_random(sub: pd.DataFrame, pass_mark: float) -> pd.DataFrame:
         project_deadline_date=("project_deadline_date", "first"),
         attempt_status=("attempt_status", "first"),
         submission_status=("submission_status", "max"),   # 'Submitted' > 'Not Submitted'
-        marks_obtained=("marks_obtained", "max"),
+        marks_obtained=("_sub_marks", "last"),
         number_of_submissions=("submission_id", "nunique"),
         first_submission=("_sub_t", "min"),
         recent_submission=("_sub_t", "max"),
@@ -235,6 +236,11 @@ def collapse_random(sub: pd.DataFrame, pass_mark: float) -> pd.DataFrame:
         first_pass_eval_time=("_pass_t", "min"),
         evaluated_submissions=("_fb_t", "count"),
     ).reset_index()
+    latest = s.drop_duplicates(key, keep="last").set_index(key)
+    out = out.set_index(key)
+    out["marks_obtained"] = latest["_sub_marks"]
+    out["first_pass_eval_time"] = latest["_pass_t"]
+    out = out.reset_index()
     out["submission_time"] = out["recent_submission"]
     for c in ["first_submission", "recent_submission", "first_feedback_given_time",
               "latest_feedback_given_time", "first_pass_eval_time", "submission_time"]:
@@ -266,7 +272,10 @@ def build_projects(v1: pd.DataFrame, v2: pd.DataFrame, vr: pd.DataFrame, pass_ma
     df["track"] = df["module_name"].map(lambda m: assign_track(m, ss_re, sql_re))
     marks = pd.to_numeric(df.get("marks_obtained"), errors="coerce")
     df["is_submitted"] = df["submission_status"].eq("Submitted")
-    df["is_cleared"] = marks.ge(pass_mark)
+    df["is_cleared"] = (marks.ge(pass_mark) & df["is_submitted"]
+                        & df["latest_feedback_given_time"].notna()
+                        & df["recent_submission"].fillna(df["submission_time"]).notna()
+                        & df["latest_feedback_given_time"].ge(df["recent_submission"].fillna(df["submission_time"])))
     # Clear date proxy: evaluation time of the passing evaluation, else last submission
     if "first_pass_eval_time" not in df.columns:
         df["first_pass_eval_time"] = pd.NaT
@@ -312,6 +321,10 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
     known = pd.to_datetime(proj["batch"].map(starts), errors="coerce")
     keep = known.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)) | (known.isna() & rel.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)))
     proj = proj[keep]
+    proj = proj.copy()
+    proj["_feedback_sort"] = _ts(proj["latest_feedback_given_time"])
+    proj["_submission_sort"] = _ts(proj["submission_time"])
+    proj = proj.sort_values(["_submission_sort", "_feedback_sort"], ascending=False, na_position="last", kind="stable")
     proj = proj.drop_duplicates(subset=["user_id", "batch", "project", "question_id"], keep="first")
 
     marks = pd.to_numeric(proj["marks_obtained"], errors="coerce")
@@ -322,6 +335,16 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
     reeval[(fb_cnt > 0) & sub_t.notna() & last_fb.notna() & (sub_t > last_fb)] = 1
     reeval[submitted & (fb_cnt == 0)] = 2
 
+    valid_clear = (marks.ge(TRACKER_PASS_MARK) & submitted & (fb_cnt > 0)
+                   & proj["evaluation_status"].astype(str).str.strip().str.lower().eq("evaluated")
+                   & last_fb.notna() & last_fb.ge(sub_t))
+    audit = proj.assign(old_clear=marks.ge(TRACKER_PASS_MARK), new_clear=valid_clear)
+    for batch, g in audit.groupby("batch"):
+        old = g.loc[g.old_clear, "user_id"].nunique()
+        new = g.loc[g.new_clear, "user_id"].nunique()
+        log(f"Clearance audit {batch}: marks-only={old}, validated={new}")
+        if old != new:
+            log(f"  Excluded candidate IDs: {sorted(set(g.loc[g.old_clear, 'user_id']) - set(g.loc[g.new_clear, 'user_id']), key=str)}")
     out = pd.DataFrame({
         "Batch": proj["batch"],
         "user_id": pd.to_numeric(proj["user_id"], errors="coerce").astype("Int64"),
@@ -340,7 +363,7 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
         "number_of_submissions": pd.to_numeric(proj["number_of_submissions"], errors="coerce").fillna(0).astype(int),
         "marks_obtained": marks,
         "Submission Time 1": _fmt_date(proj["submission_time_1"]),
-        "Clearance": marks.ge(TRACKER_PASS_MARK).map({True: "Cleared", False: "Not Cleared"}),
+        "Clearance": valid_clear.map({True: "Cleared", False: "Not Cleared"}),
         "re_evaluation_flag": reeval.astype(int),
     })
 
