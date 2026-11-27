@@ -2,7 +2,7 @@
 """
 Project Clearance pipeline: Metabase -> Google Sheet (-> Looker Studio).
 
-Runs from GitHub Actions 4x/day. Each run:
+Runs from GitHub Actions. Each run:
   1. Exports Metabase cards via API:
        #6241 DS-Project-1    (older course structures, incl. non-submitters)
        #6959 Project-1-1     (newer course structures, submitters from 2025)
@@ -10,8 +10,8 @@ Runs from GitHub Actions 4x/day. Each run:
        #7577 Placement_grooming_sessions ("groomer")
   2. Reads the student master data from a Google Sheet.
   3. Builds tabs: Raw_SS, Raw_SQL, Both_Cleared, Batch_Summary, Groomer, Master, _Refresh_Log,
-     Tracker_Raw_SS + Tracker_Raw_SQL (exact A:S layout of the tracker's "Raw - SS" / "Raw -SQL",
-     built from #6242 + #6241 + live batch roster; imported into the tracker via IMPORTRANGE)
+     Tracker_Raw_SS + Tracker_Raw_SQL (A:S base columns, plus au_type in source column T).
+     The final tracker imports column T after its helper columns.
   4. Overwrites those tabs in the output Google Sheet (Looker Studio reads from it).
 
 Secrets (only these two come from GitHub secrets):
@@ -50,7 +50,7 @@ MASTER_KEY_CANDIDATES = ["user_id", "userid", "student_id", "uid", "id"]
 MASTER_BATCH_CANDIDATES = ["batch", "batch_name", "au_batch", "course", "course_title"]
 MASTER_ACCOUNTABLE_CANDIDATES = ["accountable", "is_accountable", "accountable_flag"]
 
-# ---- Tracker feed (Project_Clearance_Tracker "Raw - SS" / "Raw -SQL" columns A:S) ----
+# ---- Tracker feed (Project_Clearance_Tracker "Raw - SS" / "Raw -SQL" columns A:T) ----
 TRACKER_PASS_MARK = 8                    # Clearance = "Cleared" when marks_obtained >= 8 (matches tracker)
 TRACKER_MIN_COURSE_START = "2025-01-01"  # batches starting on/after this date
 TRACKER_SS_STRUCTURES = (50, 193)        # Spreadsheets batch course structures (roster)
@@ -125,10 +125,21 @@ select distinct
     cc.course_structure_id,
     date(cc.start_timestamp) as course_start,
     cum.user_id,
-    concat(au.first_name, ' ', au.last_name) as name
+    concat(au.first_name, ' ', au.last_name) as name,
+    case
+        when nullif(btrim(au_course.title), '') is null then 'Unknown'
+        when au_course.title ~* 'advantage[[:space:]]*(plus|[+])' then 'Advantage Plus'
+        when au_course.title ilike '%advantage%' then 'Advantage'
+        when au_course.title ilike '%Professional Certificate Course In Data Science%'
+          or au_course.title ilike '%Full Data Science%'
+          or au_course.title ilike '%Full DS%' then 'Full DS'
+        else 'Other'
+    end as au_type
 from courses_courseusermapping cum
 join courses_course cc on cc.id = cum.course_id
 join auth_user au on au.id = cum.user_id
+left join courses_courseusermapping au_mapping on au_mapping.id = cum.admin_course_user_mapping_id
+left join courses_course au_course on au_course.id = au_mapping.course_id
 where cum.status = 8
   and cc.course_structure_id in (50, 193, 52)
   and cc.start_timestamp >= '2025-01-01'
@@ -240,6 +251,7 @@ def collapse_random(sub: pd.DataFrame, pass_mark: float) -> pd.DataFrame:
     out = out.set_index(key)
     out["marks_obtained"] = latest["_sub_marks"]
     out["first_pass_eval_time"] = latest["_pass_t"]
+    out["au_type"] = latest["au_type"] if "au_type" in latest.columns else "Unknown"
     out = out.reset_index()
     out["submission_time"] = out["recent_submission"]
     for c in ["first_submission", "recent_submission", "first_feedback_given_time",
@@ -291,7 +303,7 @@ TRACKER_HEADERS = [
     "Batch", "user_id", "Name", "Module_name", "project_release_date", "Project", "question_title",
     "project_deadline_date", "Submission Status", "Submission Time", "Evaluation Status",
     "first_feedback_given_time", "latest_feedback_given_time", "feedback_received_count",
-    "number_of_submissions", "marks_obtained", "Submission Time 1", "Clearance", "re_evaluation_flag",
+    "number_of_submissions", "marks_obtained", "Submission Time 1", "Clearance", "re_evaluation_flag", "au_type",
 ]
 
 
@@ -308,7 +320,7 @@ def _fmt_date(s: pd.Series) -> pd.Series:
 
 def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
                       roster: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Rebuild the tracker's Raw - SS / Raw -SQL (cols A:S): one row per student x project
+    """Rebuild the tracker's Raw - SS / Raw -SQL (cols A:T): one row per student x project
     from #6242 (random-question projects) + #6241 (fixed-question projects), plus 'null' rows
     for roster students in batches whose project has not been released yet."""
     proj = pd.concat([random_df, fixed_df], ignore_index=True, sort=False)
@@ -367,6 +379,10 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
         "re_evaluation_flag": reeval.astype(int),
     })
 
+    out["au_type"] = (
+        proj["au_type"].fillna("Unknown") if "au_type" in proj.columns else "Unknown"
+    )
+
     # 'null' rows: roster students of batches that have no project rows yet
     r = roster.copy()
     r["Module_name"] = r["course_structure_id"].map(
@@ -375,6 +391,9 @@ def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
     nulls = pd.DataFrame({h: "null" for h in TRACKER_HEADERS}, index=r.index)
     nulls["Batch"], nulls["user_id"], nulls["Name"] = r["batch"], pd.to_numeric(r["user_id"]).astype("Int64"), r["name"]
     nulls["Module_name"], nulls["Clearance"], nulls["re_evaluation_flag"] = r["Module_name"], "Not Cleared", 0
+    nulls["au_type"] = (
+        r["au_type"].fillna("Unknown") if "au_type" in r.columns else "Unknown"
+    )
     full = pd.concat([out, nulls], ignore_index=True)
     full = full.astype(object).where(full.notna(), "null")
     full = full.sort_values(["Batch", "user_id"], kind="stable")
@@ -511,6 +530,8 @@ def main() -> int:
     both = attach_master(build_both_cleared(projects), master, key_col)
     summary = build_batch_summary(projects, master, batch_col, acc_col, now)
     projects = attach_master(projects, master, key_col)
+    au_type = projects.pop("au_type") if "au_type" in projects.columns else None
+    projects["au_type"] = au_type.fillna("Unknown") if au_type is not None else "Unknown"
 
     tabs = {
         "Raw_SS": projects[projects["track"] == "Excel"],  # DS 02 Spreadsheets
