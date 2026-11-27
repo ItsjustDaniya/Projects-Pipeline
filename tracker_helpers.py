@@ -1,564 +1,375 @@
-#!/usr/bin/env python3
 """
-Project Clearance pipeline: Metabase -> Google Sheet (-> Looker Studio).
+Helper columns for Project_Clearance_Tracker "Raw - SS" (T:AR) and "Raw -SQL" (T:AP).
 
-Runs from GitHub Actions. Each run:
-  1. Exports Metabase cards via API:
-       #6241 DS-Project-1    (older course structures, incl. non-submitters)
-       #6959 Project-1-1     (newer course structures, submitters from 2025)
-       #6579 submission vs evaluations - 2 (random-question projects: ALL 2026 batches)
-       #7577 Placement_grooming_sessions ("groomer")
-  2. Reads the student master data from a Google Sheet.
-  3. Builds tabs: Raw_SS, Raw_SQL, Both_Cleared, Batch_Summary, Groomer, Master, _Refresh_Log,
-     Tracker_Raw_SS + Tracker_Raw_SQL (A:S base columns, plus au_type in source column T).
-     The final tracker imports column T after its helper columns.
-  4. Overwrites those tabs in the output Google Sheet (Looker Studio reads from it).
+Until now these were per-row formulas in the tracker, dragged down by hand next to the
+IMPORTRANGE of Tracker_Raw_SS / Tracker_Raw_SQL (A:S). Every new batch added rows below the
+last dragged formula, so the helper cells went blank and the summary tabs quietly under-counted
+(this is what broke F38 on the ageing tab in Oct 2026).
 
-Secrets (only these two come from GitHub secrets):
-  METABASE_API_KEY      Metabase API key (Admin > Settings > Authentication > API keys)
-  GCP_SA_JSON           full JSON of the Google service account key
-Everything else is in the CONFIG block below.
+This module rebuilds the same columns in Python, at the same positions and with the same
+headers, so the tracker can import A:AR / A:AP in one IMPORTRANGE and drop the dragged formulas.
+
+Lookups the formulas used, and where they come from now:
+  Activity tab (Z)            -> Metabase card "PC - Tracker Student Lookups" (sql/tracker_student_lookups.sql)
+  Persona, Raw - SS (AB)      -> same card, Acad Interview persona (was a hand-typed column)
+  Persona, Raw -SQL (AB)      -> Placements FlyWheel sheet, "All Bible" (cols A, F), as before
+  Placement tab (AA/AC/AD)    -> Placements FlyWheel sheet, "Prog<>Placement" (cols A, T, F, E)
+  1st Submission tab (SS AL / SQL AJ) -> submissions_ranked sheet (Projects---Daily-Update cron)
+
+Columns whose formulas were already broken in the tracker are kept as empty columns so every
+other column keeps its position (W, X, AE, AF, AG, AP; AE on SQL). See BROKEN_COLUMNS.
+
+Dates are written as Google Sheets serial numbers (days since 1899-12-30), so they import as
+real dates: MODE()/ISNUMBER() on the deadline column keep working, and the tracker's existing
+column formats display them.
 """
 from __future__ import annotations
 
-import io
-import json
-import os
+import math
 import re
-import sys
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime
 
-import gspread
 import pandas as pd
-import requests
-from google.oauth2.service_account import Credentials
 
-# ============================== CONFIG ======================================
-METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co"
-PASS_MARK = 8                                     # marks out of 10 needed to clear (tracker rule: >= 8)
+SHEETS_EPOCH = datetime(1899, 12, 30)
 
-OUTPUT_SHEET_ID = "1Vec4-7mmLqtXMz9-rTZEvIxsV3nVgjm1KVjhOH_JcCc"   # Looker Studio reads this
-MASTER_SHEET_ID = "1a6pdd4M3gKTUdRpb9HHzMAVnkrPwr-YPNwoaPT01Ghw"   # Master Data
-MASTER_TAB = "Master Data 2023-2026"             # falls back to the first tab if not found
+SS_HELPER_HEADERS = [
+    "Batch", "Days", "Week", "Expected ", "Week Target", "Final feedback month", "Activity",
+    "", "Persona", "", "", "Attendance", "Assignment", "MC", "project_deadline_date - 1",
+    "Submission Time - 1", "WOW Submission", "Sumission Month", "1st Submisison", "Clearance Time",
+    "WOW Clearance", "Clearance Month", "", "Submission Month", "Clearance month",
+]  # T..AR (25 columns)
 
-# Master columns: set exact header names, or leave None to auto-detect from the candidates
-MASTER_KEY_COL = None          # student id column
-MASTER_BATCH_COL = None        # batch column
-MASTER_ACCOUNTABLE_COL = None  # TRUE/Yes/1 = Accountable student
-MASTER_KEY_CANDIDATES = ["user_id", "userid", "student_id", "uid", "id"]
-MASTER_BATCH_CANDIDATES = ["batch", "batch_name", "au_batch", "course", "course_title"]
-MASTER_ACCOUNTABLE_CANDIDATES = ["accountable", "is_accountable", "accountable_flag"]
+SQL_HELPER_HEADERS = [
+    "Batch", "Days", "Week", "Expected ", "Week Target", "Final feedback month", "Activity",
+    "", "Persona", "", "", "C%", "project_deadline_date - 1", "Submission Time - 1",
+    "WOW Submission", "Sumission Month", "1st Submisison", "Clearance Time", "WOW Clearance",
+    "Clearance Month", "Clearance week", "Submission Month", "Clearance month",
+]  # T..AP (23 columns)
 
-# ---- Tracker feed (Project_Clearance_Tracker "Raw - SS" / "Raw -SQL" columns A:T) ----
-TRACKER_PASS_MARK = 8                    # Clearance = "Cleared" when marks_obtained >= 8 (matches tracker)
-TRACKER_MIN_COURSE_START = "2025-01-01"  # batches starting on/after this date
-TRACKER_SS_STRUCTURES = (50, 193)        # Spreadsheets batch course structures (roster)
-TRACKER_SQL_STRUCTURES = (52,)           # SQL batch course structures (roster)
-TRACKER_SS_MODULE = "DS 02 Spreadsheets"
-TRACKER_SQL_MODULE = "DS 04 SQL"
-# Saved Metabase question with the batch roster SQL (see ROSTER_SQL below). The API key can run
-# saved questions but not ad-hoc SQL, so paste ROSTER_SQL into a new native question, save it,
-# and put its ID here. None = skip roster ('null' rows for not-yet-released batches are omitted).
-TRACKER_ROSTER_CARD_ID = 13022   # "PC - Batch Roster"
-
-SS_MODULE_REGEX = r"spreadsheet|excel"   # DS 02 Spreadsheets
-SQL_MODULE_REGEX = r"sql"                # DS 04 SQL
-# ===========================================================================
-
-IST = timezone(timedelta(hours=5, minutes=30))
-CARDS = {"project_v1": 6241, "project_v2": 6959, "project_random": 6579, "groomer": 7577,
-         "tracker_random": 6242}
-WEEK_CHECKPOINTS = range(0, 9)    # W0..W8 (W0 = at 1st-submission deadline)
-MONTH_CHECKPOINTS = range(1, 7)   # M1..M6 after deadline
-WRITE_CHUNK_ROWS = 5000
-SHEET_CELL_LIMIT = 10_000_000
+# Formulas that were already returning #N/A / #REF! for every row in the tracker. Left blank.
+BROKEN_COLUMNS = {
+    "Expected / Week Target (W, X)": "look up a target table that no longer exists (#N/A / #REF!)",
+    "Attendance / Assignment / MC (SS: AE, AF, AG)": "XLOOKUP into ' Dump - SP' on the wrong key "
+                                                   "columns, #N/A on every row; nothing reads them",
+    "C% (SQL: AE)": "empty in the tracker",
+}
 
 
-def log(msg: str) -> None:
-    print(f"[{datetime.now(IST):%Y-%m-%d %H:%M:%S} IST] {msg}", flush=True)
-
-
-def norm_col(c: str) -> str:
-    """'User ID' -> 'user_id', 'Submission Time 1' -> 'submission_time_1'."""
-    return re.sub(r"[^0-9a-z]+", "_", str(c).strip().lower()).strip("_")
-
-
-# --------------------------------------------------------------------------- Metabase
-def fetch_card(base_url: str, api_key: str, card_id: int, retries: int = 3) -> pd.DataFrame:
-    url = f"{base_url}/api/card/{card_id}/query/csv"
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            log(f"Metabase card #{card_id}: export attempt {attempt}")
-            r = requests.post(
-                url,
-                headers={"x-api-key": api_key},
-                data={"parameters": "[]", "format_rows": "false"},
-                timeout=1200,
-            )
-            r.raise_for_status()
-            body = r.content.decode("utf-8-sig")
-            # Metabase sometimes returns 2xx with a JSON error body when the query fails
-            if body.lstrip().startswith("{") and '"error"' in body[:2000]:
-                raise RuntimeError(f"Query error: {body[:500]}")
-            df = pd.read_csv(io.StringIO(body), low_memory=False)
-            df.columns = [norm_col(c) for c in df.columns]
-            log(f"Metabase card #{card_id}: {len(df):,} rows x {len(df.columns)} cols")
-            return df
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            log(f"  failed: {e}")
-            time.sleep(30 * attempt)
-    raise RuntimeError(f"Card #{card_id} failed after {retries} attempts: {last_err}")
-
-
-ROSTER_SQL = """
-with refund as (
-    select distinct ccum.id as lu_cum_id
-    from courses_courseusermapping au
-    join courses_courseuserlabelmapping l on l.course_user_mapping_id = au.id and l.label_id = 677
-    join courses_courseusermapping ccum on ccum.admin_course_user_mapping_id = au.id
-)
-select distinct
-    cc.title as batch,
-    cc.course_structure_id,
-    date(cc.start_timestamp) as course_start,
-    cum.user_id,
-    concat(au.first_name, ' ', au.last_name) as name,
-    case
-        when nullif(btrim(au_course.title), '') is null then 'Unknown'
-        when au_course.title ~* 'advantage[[:space:]]*(plus|[+])' then 'Advantage Plus'
-        when au_course.title ilike '%advantage%' then 'Advantage'
-        when au_course.title ilike '%Professional Certificate Course In Data Science%'
-          or au_course.title ilike '%Full Data Science%'
-          or au_course.title ilike '%Full DS%' then 'Full DS'
-        else 'Other'
-    end as au_type
-from courses_courseusermapping cum
-join courses_course cc on cc.id = cum.course_id
-join auth_user au on au.id = cum.user_id
-left join courses_courseusermapping au_mapping on au_mapping.id = cum.admin_course_user_mapping_id
-left join courses_course au_course on au_course.id = au_mapping.course_id
-where cum.status = 8
-  and cc.course_structure_id in (50, 193, 52)
-  and cc.start_timestamp >= '2025-01-01'
-  and cc.title not in ('Spreadsheets (T)')
-  and cum.id not in (select lu_cum_id from refund)
-"""
-
-
-# --------------------------------------------------------------------------- Google Sheets
-def gsheet_client(sa_json: str) -> gspread.Client:
-    creds = Credentials.from_service_account_info(
-        json.loads(sa_json),
-        scopes=["https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive.readonly"],
-    )
-    return gspread.authorize(creds)
-
-
-def read_master(gc: gspread.Client, sheet_id: str, tab: str) -> pd.DataFrame:
-    sh = gc.open_by_key(sheet_id)
+# ----------------------------------------------------------------------------- parsing
+def uid_key(v) -> str:
+    """'2,091,517' / 2091517.0 / '2091517' -> '2091517'. Blank for anything else."""
+    s = str(v).replace(",", "").strip()
+    if not s or s.lower() in ("nan", "none", "null", "<na>"):
+        return ""
     try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.get_worksheet(0)
-        log(f"Master tab '{tab}' not found; using first tab '{ws.title}'")
-    rows = ws.get_all_values()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows[1:], columns=rows[0])
-    df = df.loc[:, [c for c in df.columns if str(c).strip()]]  # drop blank header cols
-    df.columns = [norm_col(c) for c in df.columns]
-    log(f"Master: {len(df):,} rows x {len(df.columns)} cols")
-    return df
+        return str(int(float(s)))
+    except ValueError:
+        return s
 
 
-def to_values(df: pd.DataFrame) -> list[list]:
-    out = df.copy()
-    for c in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[c]):
-            out[c] = out[c].dt.strftime("%Y-%m-%d %H:%M:%S")
-    out = out.astype(object).where(pd.notna(out), "")
-    return [list(out.columns)] + out.values.tolist()
-
-
-def write_tab(sh: gspread.Spreadsheet, title: str, df: pd.DataFrame) -> None:
-    values = to_values(df)
-    n_rows, n_cols = len(values), max(len(values[0]), 1)
-    if n_rows * n_cols > SHEET_CELL_LIMIT * 0.9:
-        log(f"WARNING: {title} is {n_rows*n_cols:,} cells, close to the 10M Sheets limit")
+def _date10(v) -> date | None:
+    """DATEVALUE(LEFT(v,10)) for 'YYYY-MM-DD...' text; None for 'null' / blank / junk."""
+    s = str(v).strip()
+    if len(s) < 10:
+        return None
     try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=n_rows, cols=n_cols)
-    ws.clear()
-    ws.resize(rows=max(n_rows, 2), cols=n_cols)
-    # RAW so marks bands like "6-7" and IDs are never auto-converted to dates
-    for i in range(0, n_rows, WRITE_CHUNK_ROWS):
-        ws.update(range_name=f"A{i + 1}", values=values[i:i + WRITE_CHUNK_ROWS],
-                  value_input_option="RAW")
-    log(f"Wrote {title}: {n_rows - 1:,} rows")
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
-# --------------------------------------------------------------------------- Transforms
-def assign_track(module: str, ss_re: str, sql_re: str) -> str:
-    m = str(module).lower()
-    if re.search(ss_re, m):
-        return "Excel"
-    if re.search(sql_re, m):
-        return "SQL"
-    return "Other"
+def _datetime19(v) -> datetime | None:
+    """DATEVALUE(LEFT(v,10)) + TIMEVALUE(MID(v,12,8)) for 'YYYY-MM-DD HH:MM:SS...'."""
+    s = str(v).strip()
+    try:
+        return datetime.strptime(s[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        d = _date10(s)
+        return datetime(d.year, d.month, d.day) if d else None
 
 
-def _ts(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(IST).dt.tz_localize(None)
+def serial(v: date | datetime | None):
+    if v is None:
+        return ""
+    if not isinstance(v, datetime):
+        v = datetime(v.year, v.month, v.day)
+    x = (v - SHEETS_EPOCH).total_seconds() / 86400
+    return int(x) if x == int(x) else round(x, 6)
 
 
-def collapse_random(sub: pd.DataFrame, pass_mark: float) -> pd.DataFrame:
-    """#6579 is one row per submission; collapse to one row per student x project x question
-    in the same shape as #6241/#6959. Clear time = evaluation time of the FIRST submission
-    whose submission-level marks >= pass mark (falls back to final question marks)."""
-    if sub.empty:
-        return sub
-    s = sub.copy()
-    s["_sub_t"] = _ts(s["submission_time"])
-    s["_fb_t"] = _ts(s["feedback_given_time"])
-    s["_sub_marks"] = pd.to_numeric(s.get("marks_submission_level"), errors="coerce")
-    s["_pass_t"] = s["_fb_t"].where(s["_sub_marks"].ge(pass_mark))
-    key = ["user_id", "batch", "project", "question_id"]
-    s = s.sort_values(["_sub_t", "_fb_t"], na_position="first", kind="stable")
-    g = s.groupby(key, dropna=False)
-    out = g.agg(
-        name=("student_name", "first"),
-        module_name=("module_name", "first"),
-        question_title=("question_title", "first"),
-        project_release_date=("project_release_date", "first"),
-        project_deadline_date=("project_deadline_date", "first"),
-        attempt_status=("attempt_status", "first"),
-        submission_status=("submission_status", "max"),   # 'Submitted' > 'Not Submitted'
-        marks_obtained=("_sub_marks", "last"),
-        number_of_submissions=("submission_id", "nunique"),
-        first_submission=("_sub_t", "min"),
-        recent_submission=("_sub_t", "max"),
-        first_feedback_given_time=("_fb_t", "min"),
-        latest_feedback_given_time=("_fb_t", "max"),
-        first_pass_eval_time=("_pass_t", "min"),
-        evaluated_submissions=("_fb_t", "count"),
-    ).reset_index()
-    latest = s.drop_duplicates(key, keep="last").set_index(key)
-    out = out.set_index(key)
-    out["marks_obtained"] = latest["_sub_marks"]
-    out["first_pass_eval_time"] = latest["_pass_t"]
-    out["au_type"] = latest["au_type"] if "au_type" in latest.columns else "Unknown"
-    out = out.reset_index()
-    out["submission_time"] = out["recent_submission"]
-    for c in ["first_submission", "recent_submission", "first_feedback_given_time",
-              "latest_feedback_given_time", "first_pass_eval_time", "submission_time"]:
-        out[c] = out[c].dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")  # tz-aware text, re-parsed below
-    out["source_card"] = CARDS["project_random"]
+def month_text(v: date | datetime | None) -> str:
+    return v.strftime("%B %Y") if v else ""
+
+
+def _roundup(x: float) -> int:
+    """Sheets ROUNDUP(x, 0): away from zero."""
+    return math.ceil(x) if x >= 0 else -math.ceil(-x)
+
+
+_MONTH_BATCH = re.compile(r"((?:January|February|March|April|May|June|July|August|September|"
+                          r"October|November|December)(?: [AB])? \d{4})\s*$")
+
+
+def short_batch(full: str) -> str:
+    """=TRIM(MID(A, FIND("-", A) + 1, LEN(A)))  ('DS Spreadsheets - July A 2026' -> 'July A 2026').
+    Names without a '-' ('DS SQL November 2025') errored in the sheet and were typed over by
+    hand with the trailing month; do the same here."""
+    s = str(full)
+    i = s.find("-")
+    if i >= 0:
+        return s[i + 1:].strip()
+    m = _MONTH_BATCH.search(s)
+    return m.group(1) if m else s.strip()
+
+
+# ----------------------------------------------------------------------------- per-row rules
+def days_to_final_feedback(re_eval, first_fb, last_fb):
+    """U  =IF(S=0, IF(OR(M="",L=""),"", INT(DATEVALUE(LEFT(M,10))-DATEVALUE(LEFT(L,10)))), 0)"""
+    if str(re_eval).strip() not in ("0", "0.0", ""):
+        return 0
+    l, m = _date10(first_fb), _date10(last_fb)
+    return (m - l).days if (l and m) else ""
+
+
+def week_of_current_month(last_fb, today: date):
+    """V  'W1'..'W5' when the final feedback falls in the current month (the tracker had the
+    month hard-coded, last set to October 2026)."""
+    m = _date10(last_fb)
+    if not m or (m.year, m.month) != (today.year, today.month):
+        return ""
+    return f"W{min(5, _roundup(m.day / 7))}"
+
+
+def wow_submission(first_sub: date | None, deadline: date | None):
+    """SS AJ / SQL AH  =IF(AI<=AH,0,IF(ROUNDUP((AI-AH)/7,0)>12,"",ROUNDUP((AI-AH)/7,0)))"""
+    if not first_sub or not deadline:
+        return ""
+    d = (first_sub - deadline).days
+    if d <= 0:
+        return 0
+    w = _roundup(d / 7)
+    return w if w <= 12 else ""
+
+
+def wow_clearance(clear_at: datetime | None, deadline: date | None):
+    """SS AN / SQL AL  =IF(AM<AH,0,IF(INT((AM-AH)/7)+1>12,"",INT((AM-AH)/7)+1))"""
+    if not clear_at or not deadline:
+        return ""
+    d = (clear_at - datetime(deadline.year, deadline.month, deadline.day)).total_seconds() / 86400
+    if d < 0:
+        return 0
+    w = int(d // 7) + 1
+    return w if w <= 12 else ""
+
+
+def submission_month_bucket(first_sub: date | None, deadline: date | None):
+    """SS AQ / SQL AO  =IF(AI<AH-14,"",IF(AI<=AH,0,ROUNDUP((AI-AH)/29,0)))"""
+    if not first_sub or not deadline:
+        return ""
+    d = (first_sub - deadline).days
+    if d < -14:
+        return ""
+    return 0 if d <= 0 else _roundup(d / 29)
+
+
+def clearance_month_bucket_ss(cleared: bool, clear_at: datetime | None, deadline: date | None):
+    """SS AR  =IF(R="Cleared",IF(AM<=AH,0,IF(ROUNDUP((AM-AH)/30,0)>12,"",ROUNDUP((AM-AH)/30,0))),"")"""
+    if not cleared or not clear_at or not deadline:
+        return ""
+    d = (clear_at.date() - deadline).days
+    if d <= 0:
+        return 0
+    m = _roundup(d / 30)
+    return m if m <= 12 else ""
+
+
+def clearance_month_bucket_sql(cleared: bool, clear_at: datetime | None, deadline: date | None):
+    """SQL AP  =IF(R="Cleared",IF(AK<AF-14,"",IF(AK<=AF,0,IF(ROUNDUP((AK-AF)/29,0)>12,"",ROUNDUP(...)))),"")"""
+    if not cleared or not clear_at or not deadline:
+        return ""
+    d = (clear_at.date() - deadline).days
+    if d < -14:
+        return ""
+    if d <= 0:
+        return 0
+    m = _roundup(d / 29)
+    return m if m <= 12 else ""
+
+
+def clearance_week_sql(marks, last_fb):
+    """SQL AN  =IF(P>=8, MIN(5, INT((DAY(DATEVALUE(LEFT(M,10)))-1)/6)+1), "")"""
+    try:
+        p = float(marks)
+    except (TypeError, ValueError):
+        return ""
+    m = _date10(last_fb)
+    if p < 8 or not m:
+        return ""
+    return min(5, (m.day - 1) // 6 + 1)
+
+
+# ----------------------------------------------------------------------------- lookups
+class Lookups:
+    """All per-student lookups, keyed by uid_key(user_id). Missing keys -> blank cells."""
+
+    def __init__(self, activity30=None, placement=None, persona_ss=None, persona_sql=None,
+                 first_sub_ss=None, first_sub_sql=None):
+        self.activity30 = activity30 or {}        # uid -> 'Yes' / 'No'
+        self.placement = placement or {}          # uid -> (status, enrolled_status, phase)
+        self.persona_ss = persona_ss or {}        # uid -> Acad Interview persona (Raw - SS AB)
+        self.persona_sql = persona_sql or {}      # uid -> 'All Bible' persona (Raw -SQL AB)
+        self.first_sub_ss = first_sub_ss or {}    # uid -> first submission time (text)
+        self.first_sub_sql = first_sub_sql or {}
+
+
+def student_lookups_from_card(df: pd.DataFrame) -> tuple[dict, dict]:
+    """'PC - Tracker Student Lookups' card -> ({uid: 'Yes'/'No' 30-day activity},
+    {uid: Acad Interview persona})."""
+    need = {"user_id", "activity_last_30days", "acad_interview_persona"}
+    if df is None or df.empty or not need <= set(df.columns):
+        raise KeyError(f"student lookups card must return {sorted(need)}; got "
+                       f"{[] if df is None else list(df.columns)}")
+    activity, persona = {}, {}
+    for u, a, p in zip(df["user_id"], df["activity_last_30days"], df["acad_interview_persona"]):
+        k = uid_key(u)
+        if not k or k in activity:
+            continue
+        activity[k] = str(a).strip()
+        if pd.notna(p) and str(p).strip():
+            persona[k] = str(p).strip()
+    return activity, persona
+
+
+def placement_lookup(rows: list[list[str]]) -> dict:
+    """'Prog<>Placement' values (header row is the one whose col A is 'UserID').
+    XLOOKUP semantics: first row for a user wins. Returns uid -> (T Status, F Enrolled, E Phase)."""
+    start = next((i + 1 for i, r in enumerate(rows[:10]) if r and str(r[0]).strip().lower() == "userid"), 1)
+    out = {}
+    for r in rows[start:]:
+        r = list(r) + [""] * (20 - len(r))
+        k = uid_key(r[0])
+        if k and k not in out:
+            out[k] = (str(r[19]).strip(), str(r[5]).strip(), str(r[4]).strip())
     return out
 
 
-def build_projects(v1: pd.DataFrame, v2: pd.DataFrame, vr: pd.DataFrame, pass_mark: float,
-                   ss_re: str, sql_re: str) -> pd.DataFrame:
-    v1 = v1.assign(source_card=CARDS["project_v1"])
-    v2 = v2.assign(source_card=CARDS["project_v2"])
-    vr = collapse_random(vr, pass_mark)
-    df = pd.concat([vr, v2, v1], ignore_index=True, sort=False)
-    # Priority on overlap: #6579 (random, current batches) > #6959 > #6241 (older / non-submitters)
-    key = [c for c in ["user_id", "batch", "project", "question_id"] if c in df.columns]
-    df = df.drop_duplicates(subset=key, keep="first")
-
-    for c in ["project_release_date", "project_deadline_date"]:  # date-only, no tz shift
-        if c in df.columns:
-            d = pd.to_datetime(df[c], errors="coerce")
-            df[c] = d.dt.tz_convert(IST).dt.tz_localize(None) if d.dt.tz is not None else d
-    for c in ["first_submission",
-              "recent_submission", "first_feedback_given_time",
-              "latest_feedback_given_time", "submission_time", "first_pass_eval_time"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce", utc=True).dt.tz_convert(IST).dt.tz_localize(None)
-
-    df["track"] = df["module_name"].map(lambda m: assign_track(m, ss_re, sql_re))
-    marks = pd.to_numeric(df.get("marks_obtained"), errors="coerce")
-    df["is_submitted"] = df["submission_status"].eq("Submitted")
-    df["is_cleared"] = (marks.ge(pass_mark) & df["is_submitted"]
-                        & df["latest_feedback_given_time"].notna()
-                        & df["recent_submission"].fillna(df["submission_time"]).notna()
-                        & df["latest_feedback_given_time"].ge(df["recent_submission"].fillna(df["submission_time"])))
-    # Clear date proxy: evaluation time of the passing evaluation, else last submission
-    if "first_pass_eval_time" not in df.columns:
-        df["first_pass_eval_time"] = pd.NaT
-    clear_dt = (df["first_pass_eval_time"].fillna(df["latest_feedback_given_time"])
-                .fillna(df["recent_submission"]).fillna(df["submission_time"]))
-    df["cleared_date"] = clear_dt.where(df["is_cleared"])
-    df["first_submission_date"] = (df["first_submission"].fillna(df["submission_time"])
-                                   .where(df["is_submitted"]))
-    return df
+def persona_lookup(rows: list[list[str]]) -> dict:
+    """'All Bible' values: col A user id, col F Persona. First row for a user wins."""
+    out = {}
+    for r in rows[1:]:
+        r = list(r) + [""] * (6 - len(r))
+        k = uid_key(r[0])
+        if k and k not in out:
+            out[k] = str(r[5]).strip()
+    return out
 
 
-TRACKER_HEADERS = [
-    "Batch", "user_id", "Name", "Module_name", "project_release_date", "Project", "question_title",
-    "project_deadline_date", "Submission Status", "Submission Time", "Evaluation Status",
-    "first_feedback_given_time", "latest_feedback_given_time", "feedback_received_count",
-    "number_of_submissions", "marks_obtained", "Submission Time 1", "Clearance", "re_evaluation_flag", "au_type",
-]
+FIRST_SUBMISSION_RULES = ("first", "latest_evaluated")
 
 
-def _fmt_ts(s: pd.Series) -> pd.Series:
-    return _ts(s).dt.strftime("%Y-%m-%d %H:%M:%S")
+def first_submission_lookup(rows: list[list[str]], module: str, rule: str = "first") -> dict:
+    """submissions_ranked values -> {uid: Submission Time} for one module. Reads the whole tab
+    (the tracker's IMPORTRANGE stopped at row 5000).
+
+    rule="first"            submission_rank = 1, i.e. the student's first evaluated submission.
+                            This is what the tracker's '1st Submission' QUERY (WHERE Col1=1) was
+                            written to do.
+    rule="latest_evaluated" first row for the student in tab order, ignoring rank. The tracker's
+                            QUERY was not actually filtering to rank 1 and the tab lists ranks
+                            newest-first, so this reproduces the numbers the tracker shows today.
+    """
+    if rule not in FIRST_SUBMISSION_RULES:
+        raise ValueError(f"rule must be one of {FIRST_SUBMISSION_RULES}, got {rule!r}")
+    if not rows:
+        return {}
+    h = [str(c).strip().lower() for c in rows[0]]
+    ix = {name: h.index(name) for name in ("submission_rank", "user_id", "module_name", "submission time")}
+    out = {}
+    for r in rows[1:]:
+        r = list(r) + [""] * (len(h) - len(r))
+        if rule == "first" and str(r[ix["submission_rank"]]).strip() not in ("1", "1.0"):
+            continue
+        if str(r[ix["module_name"]]).strip() != module:
+            continue
+        k = uid_key(r[ix["user_id"]])
+        if k and k not in out:
+            out[k] = str(r[ix["submission time"]]).strip()
+    return out
 
 
-def _fmt_date(s: pd.Series) -> pd.Series:
-    d = pd.to_datetime(s, errors="coerce")
-    if d.dt.tz is not None:
-        d = d.dt.tz_convert(IST).dt.tz_localize(None)
-    return d.dt.strftime("%Y-%m-%d")
+# ----------------------------------------------------------------------------- builders
+def _common(row, lk: Lookups, today: date, persona: dict):
+    uid = uid_key(row["user_id"])
+    status, enrolled, phase = lk.placement.get(uid, ("", "", ""))
+    first_fb, last_fb = row["first_feedback_given_time"], row["latest_feedback_given_time"]
+    no_eval = _date10(first_fb) is None
+    cleared = str(row["Clearance"]).strip() == "Cleared"
+    last_fb_d = _date10(last_fb)
+    return uid, [
+        short_batch(row["Batch"]),                                            # T  Batch
+        days_to_final_feedback(row["re_evaluation_flag"], first_fb, last_fb), # U  Days
+        week_of_current_month(last_fb, today),                                # V  Week
+        "",                                                                   # W  Expected (broken)
+        "Not submitted/Not Evaluated" if no_eval else "",                     # X  Week Target
+        month_text(last_fb_d) if cleared else "",                             # Y  Final feedback month
+        lk.activity30.get(uid, ""),                                           # Z  Activity
+        status,                                                               # AA Placement status
+        persona.get(uid, ""),                                                 # AB Persona
+        enrolled,                                                             # AC Enrolled status
+        phase,                                                                # AD Phase
+    ], cleared
 
 
-def build_tracker_raw(random_df: pd.DataFrame, fixed_df: pd.DataFrame,
-                      roster: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Rebuild the tracker's Raw - SS / Raw -SQL (cols A:T): one row per student x project
-    from #6242 (random-question projects) + #6241 (fixed-question projects), plus 'null' rows
-    for roster students in batches whose project has not been released yet."""
-    proj = pd.concat([random_df, fixed_df], ignore_index=True, sort=False)
-    proj = proj[proj["module_name"].isin([TRACKER_SS_MODULE, TRACKER_SQL_MODULE])].copy()
-    rel = pd.to_datetime(proj["project_release_date"], errors="coerce")
-    if rel.dt.tz is not None:
-        rel = rel.dt.tz_localize(None)
-    starts = {b: pd.to_datetime(d, errors="coerce")
-              for b, d in roster.drop_duplicates("batch")[["batch", "course_start"]].itertuples(index=False)}
-    known = pd.to_datetime(proj["batch"].map(starts), errors="coerce")
-    keep = known.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)) | (known.isna() & rel.ge(pd.Timestamp(TRACKER_MIN_COURSE_START)))
-    proj = proj[keep]
-    proj = proj.copy()
-    proj["_feedback_sort"] = _ts(proj["latest_feedback_given_time"])
-    proj["_submission_sort"] = _ts(proj["submission_time"])
-    proj = proj.sort_values(["_submission_sort", "_feedback_sort"], ascending=False, na_position="last", kind="stable")
-    proj = proj.drop_duplicates(subset=["user_id", "batch", "project", "question_id"], keep="first")
-
-    marks = pd.to_numeric(proj["marks_obtained"], errors="coerce")
-    fb_cnt = pd.to_numeric(proj["feedback_received_count"], errors="coerce").fillna(0)
-    sub_t, last_fb = _ts(proj["submission_time"]), _ts(proj["latest_feedback_given_time"])
-    submitted = proj["submission_status"].eq("Submitted") & sub_t.notna()
-    reeval = pd.Series(0, index=proj.index)
-    reeval[(fb_cnt > 0) & sub_t.notna() & last_fb.notna() & (sub_t > last_fb)] = 1
-    reeval[submitted & (fb_cnt == 0)] = 2
-
-    valid_clear = (marks.ge(TRACKER_PASS_MARK) & submitted & (fb_cnt > 0)
-                   & proj["evaluation_status"].astype(str).str.strip().str.lower().eq("evaluated")
-                   & last_fb.notna() & last_fb.ge(sub_t))
-    audit = proj.assign(old_clear=marks.ge(TRACKER_PASS_MARK), new_clear=valid_clear)
-    for batch, g in audit.groupby("batch"):
-        old = g.loc[g.old_clear, "user_id"].nunique()
-        new = g.loc[g.new_clear, "user_id"].nunique()
-        log(f"Clearance audit {batch}: marks-only={old}, validated={new}")
-        if old != new:
-            log(f"  Excluded candidate IDs: {sorted(set(g.loc[g.old_clear, 'user_id']) - set(g.loc[g.new_clear, 'user_id']), key=str)}")
-    out = pd.DataFrame({
-        "Batch": proj["batch"],
-        "user_id": pd.to_numeric(proj["user_id"], errors="coerce").astype("Int64"),
-        "Name": proj["name"],
-        "Module_name": proj["module_name"],
-        "project_release_date": _fmt_date(proj["project_release_date"]),
-        "Project": proj["project"],
-        "question_title": proj["question_title"],
-        "project_deadline_date": _fmt_date(proj["project_deadline_date"]),
-        "Submission Status": proj["submission_status"],
-        "Submission Time": sub_t.dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "Evaluation Status": proj["evaluation_status"],
-        "first_feedback_given_time": _fmt_ts(proj["first_feedback_given_time"]),
-        "latest_feedback_given_time": last_fb.dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "feedback_received_count": fb_cnt.astype(int),
-        "number_of_submissions": pd.to_numeric(proj["number_of_submissions"], errors="coerce").fillna(0).astype(int),
-        "marks_obtained": marks,
-        "Submission Time 1": _fmt_date(proj["submission_time_1"]),
-        "Clearance": valid_clear.map({True: "Cleared", False: "Not Cleared"}),
-        "re_evaluation_flag": reeval.astype(int),
-    })
-
-    out["au_type"] = (
-        proj["au_type"].fillna("Unknown") if "au_type" in proj.columns else "Unknown"
-    )
-
-    # 'null' rows: roster students of batches that have no project rows yet
-    r = roster.copy()
-    r["Module_name"] = r["course_structure_id"].map(
-        lambda cs: TRACKER_SS_MODULE if cs in TRACKER_SS_STRUCTURES else TRACKER_SQL_MODULE)
-    r = r[~r["batch"].isin(set(out["Batch"]))]
-    nulls = pd.DataFrame({h: "null" for h in TRACKER_HEADERS}, index=r.index)
-    nulls["Batch"], nulls["user_id"], nulls["Name"] = r["batch"], pd.to_numeric(r["user_id"]).astype("Int64"), r["name"]
-    nulls["Module_name"], nulls["Clearance"], nulls["re_evaluation_flag"] = r["Module_name"], "Not Cleared", 0
-    nulls["au_type"] = (
-        r["au_type"].fillna("Unknown") if "au_type" in r.columns else "Unknown"
-    )
-    full = pd.concat([out, nulls], ignore_index=True)
-    full = full.astype(object).where(full.notna(), "null")
-    full = full.sort_values(["Batch", "user_id"], kind="stable")
-    return {
-        "Tracker_Raw_SS": full[full["Module_name"] == TRACKER_SS_MODULE][TRACKER_HEADERS],
-        "Tracker_Raw_SQL": full[full["Module_name"] == TRACKER_SQL_MODULE][TRACKER_HEADERS],
-    }
+def build_ss_helpers(raw: pd.DataFrame, lk: Lookups, today: date) -> pd.DataFrame:
+    """Raw - SS T:AR for each row of Tracker_Raw_SS (same order)."""
+    out = []
+    for _, row in raw.iterrows():
+        uid, cols, cleared = _common(row, lk, today, lk.persona_ss)
+        deadline = _date10(row["project_deadline_date"])
+        first_sub_txt = lk.first_sub_ss.get(uid) or row["Submission Time"]
+        first_sub = _date10(first_sub_txt)
+        clear_at = _datetime19(row["latest_feedback_given_time"])
+        cols += [
+            "", "", "",                                                       # AE AF AG (broken)
+            serial(deadline) if deadline else row["project_deadline_date"],   # AH deadline
+            serial(first_sub),                                                # AI 1st submission date
+            wow_submission(first_sub, deadline),                              # AJ WOW Submission
+            month_text(first_sub),                                            # AK Submission month
+            first_sub_txt,                                                    # AL 1st Submission
+            serial(clear_at),                                                 # AM Clearance Time
+            wow_clearance(clear_at, deadline),                                # AN WOW Clearance
+            month_text(clear_at),                                             # AO Clearance Month
+            "",                                                               # AP
+            submission_month_bucket(first_sub, deadline),                     # AQ Submission Month
+            clearance_month_bucket_ss(cleared, clear_at, deadline),           # AR Clearance month
+        ]
+        out.append(cols)
+    return pd.DataFrame(out, columns=[f"_h{i}" for i in range(len(SS_HELPER_HEADERS))], index=raw.index)
 
 
-def attach_master(df: pd.DataFrame, master: pd.DataFrame, key_col: str) -> pd.DataFrame:
-    if master.empty or key_col not in master.columns:
-        return df
-    m = master.drop_duplicates(subset=[key_col]).copy()
-    m["_mk"] = m[key_col].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    m = m.drop(columns=[key_col]).rename(columns={c: f"master_{c}" for c in m.columns if c not in (key_col, "_mk")})
-    out = df.copy()
-    out["_k"] = out["user_id"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    return out.merge(m, how="left", left_on="_k", right_on="_mk").drop(columns=["_k", "_mk"])
-
-
-def build_both_cleared(df: pd.DataFrame) -> pd.DataFrame:
-    cleared = df[df["is_cleared"] & df["track"].isin(["Excel", "SQL"])]
-    per = (cleared.groupby(["user_id", "track"])["cleared_date"].min()
-           .unstack("track").reindex(columns=["Excel", "SQL"]))
-    per.columns = ["excel_cleared_date", "sql_cleared_date"]
-    info = (df.sort_values("track").groupby("user_id")
-            .agg(name=("name", "first"), batch=("batch", "first")))
-    both = info.join(per, how="inner").reset_index()
-    both["both_cleared_date"] = both[["excel_cleared_date", "sql_cleared_date"]].max(axis=1, skipna=False)
-    both["is_both_cleared"] = both["both_cleared_date"].notna()
-    return both
-
-
-def build_batch_summary(df: pd.DataFrame, master: pd.DataFrame, batch_col: str | None,
-                        acc_col: str | None, now: datetime) -> pd.DataFrame:
-    today = pd.Timestamp(now.replace(tzinfo=None))
-    d = df[df["track"].isin(["Excel", "SQL"])].copy()
-    rows = []
-    for (batch, track), g in d.groupby(["batch", "track"]):
-        g = g.drop_duplicates("user_id")  # one row per student per track
-        deadline = g["project_deadline_date"].min()
-        row = {
-            "batch": batch, "track": track,
-            "project_release_date": g["project_release_date"].min(),
-            "project_deadline_date": deadline,
-            "students_in_raw": g["user_id"].nunique(),
-            "submitted": int(g["is_submitted"].sum()),
-            "cleared_mtd": int(g["is_cleared"].sum()),
-            "avg_submissions_per_clear": round(
-                pd.to_numeric(g.loc[g["is_cleared"], "number_of_submissions"], errors="coerce").mean(), 2)
-            if g["is_cleared"].any() else None,
-        }
-        if pd.notna(deadline):
-            cutoff0 = deadline + pd.Timedelta(days=1)  # end of deadline day
-            for w in WEEK_CHECKPOINTS:
-                cp = cutoff0 + pd.Timedelta(days=7 * w)
-                row[f"sub_W{w}"] = int((g["first_submission_date"] < cp).sum()) if cp <= today + pd.Timedelta(days=1) else None
-                row[f"clr_W{w}"] = int((g["cleared_date"] < cp).sum()) if cp <= today + pd.Timedelta(days=1) else None
-            row["clr_M0"] = row["clr_W0"]
-            for mth in MONTH_CHECKPOINTS:
-                cp = cutoff0 + pd.DateOffset(months=mth)
-                row[f"clr_M{mth}"] = int((g["cleared_date"] < cp).sum()) if cp <= today + pd.Timedelta(days=1) else None
-        rows.append(row)
-    summary = pd.DataFrame(rows)
-
-    # Accountable denominator from master data, if configured
-    if not summary.empty and batch_col and acc_col and {batch_col, acc_col} <= set(master.columns):
-        flag = master[acc_col].astype(str).str.strip().str.lower().isin(["true", "yes", "y", "1"])
-        acc = master[flag].groupby(batch_col).size().rename("accountable")
-        summary = summary.merge(acc, how="left", left_on="batch", right_index=True)
-        summary["clearance_pct_mtd"] = (summary["cleared_mtd"] / summary["accountable"]).round(4)
-        summary["submission_pct_mtd"] = (summary["submitted"] / summary["accountable"]).round(4)
-    summary["refreshed_at_ist"] = now.strftime("%Y-%m-%d %H:%M:%S")
-    return summary
-
-
-# --------------------------------------------------------------------------- Main
-def pick_col(cols, explicit, candidates, label):
-    if explicit:
-        c = norm_col(explicit)
-        if c not in cols:
-            log(f"WARNING: master column '{explicit}' ({label}) not found in {list(cols)[:20]}")
-            return None
-        return c
-    for cand in candidates:
-        if cand in cols:
-            log(f"Master {label} column auto-detected: '{cand}'")
-            return cand
-    log(f"Master {label} column not found (set MASTER_{label.upper()}_COL). Columns: {list(cols)[:20]}")
-    return None
-
-
-def main() -> int:
-    env = os.environ
-    for k in ["METABASE_API_KEY", "GCP_SA_JSON"]:
-        if not env.get(k):
-            log(f"Missing required secret: {k}")
-            return 1
-
-    now = datetime.now(IST)
-    mb_url, mb_key = METABASE_URL.rstrip("/"), env["METABASE_API_KEY"]
-    pass_mark = float(PASS_MARK)
-    ss_re, sql_re = SS_MODULE_REGEX, SQL_MODULE_REGEX
-
-    gc = gsheet_client(env["GCP_SA_JSON"])
-
-    v1 = fetch_card(mb_url, mb_key, CARDS["project_v1"])
-    v2 = fetch_card(mb_url, mb_key, CARDS["project_v2"])
-    vr = fetch_card(mb_url, mb_key, CARDS["project_random"])
-    tr = fetch_card(mb_url, mb_key, CARDS["tracker_random"])
-    if TRACKER_ROSTER_CARD_ID:
-        try:
-            roster = fetch_card(mb_url, mb_key, int(TRACKER_ROSTER_CARD_ID))
-        except Exception as e:  # noqa: BLE001
-            log(f"WARNING: roster card failed, continuing without it: {e}")
-            roster = pd.DataFrame()
-    else:
-        log("NOTE: TRACKER_ROSTER_CARD_ID not set - skipping 'null' rows for unreleased batches")
-        roster = pd.DataFrame()
-    if roster.empty:
-        roster = pd.DataFrame(columns=["batch", "course_structure_id", "course_start", "user_id", "name"])
-    groomer = fetch_card(mb_url, mb_key, CARDS["groomer"])
-    master = read_master(gc, MASTER_SHEET_ID, MASTER_TAB) if MASTER_SHEET_ID else pd.DataFrame()
-    cols = set(master.columns)
-    key_col = pick_col(cols, MASTER_KEY_COL, MASTER_KEY_CANDIDATES, "key") or "user_id"
-    batch_col = pick_col(cols, MASTER_BATCH_COL, MASTER_BATCH_CANDIDATES, "batch")
-    acc_col = pick_col(cols, MASTER_ACCOUNTABLE_COL, MASTER_ACCOUNTABLE_CANDIDATES, "accountable")
-
-    projects = build_projects(v1, v2, vr, pass_mark, ss_re, sql_re)
-    other = projects[projects["track"] == "Other"]["module_name"].dropna().unique()
-    if len(other):
-        log(f"NOTE: modules not matched to Excel/SQL (excluded): {list(other)[:10]}")
-
-    both = attach_master(build_both_cleared(projects), master, key_col)
-    summary = build_batch_summary(projects, master, batch_col, acc_col, now)
-    projects = attach_master(projects, master, key_col)
-    au_type = projects.pop("au_type") if "au_type" in projects.columns else None
-    projects["au_type"] = au_type.fillna("Unknown") if au_type is not None else "Unknown"
-
-    tabs = {
-        "Raw_SS": projects[projects["track"] == "Excel"],  # DS 02 Spreadsheets
-        "Raw_SQL": projects[projects["track"] == "SQL"],
-        "Both_Cleared": both,
-        "Batch_Summary": summary,
-        "Groomer": groomer,
-    }
-    if not master.empty:
-        tabs["Master"] = master
-    tabs.update(build_tracker_raw(tr, v1, roster))
-
-    sh = gc.open_by_key(OUTPUT_SHEET_ID)
-    for title, df in tabs.items():
-        write_tab(sh, title, df)
-
-    # Append-only run log (Looker can show "last refreshed")
-    try:
-        log_ws = sh.worksheet("_Refresh_Log")
-    except gspread.WorksheetNotFound:
-        log_ws = sh.add_worksheet(title="_Refresh_Log", rows=2, cols=len(tabs) + 1)
-        log_ws.update(range_name="A1", values=[["refreshed_at_ist", *tabs.keys()]])
-    log_ws.append_row([now.strftime("%Y-%m-%d %H:%M:%S"), *[len(d) for d in tabs.values()]],
-                      value_input_option="RAW")
-    log("Done.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def build_sql_helpers(raw: pd.DataFrame, lk: Lookups, today: date) -> pd.DataFrame:
+    """Raw -SQL T:AP for each row of Tracker_Raw_SQL (same order)."""
+    out = []
+    for _, row in raw.iterrows():
+        uid, cols, cleared = _common(row, lk, today, lk.persona_sql)
+        deadline = _date10(row["project_deadline_date"])
+        first_sub_txt = lk.first_sub_sql.get(uid) or row["Submission Time"]
+        first_sub = _date10(first_sub_txt)
+        clear_at = _datetime19(row["latest_feedback_given_time"])
+        cols += [
+            "",                                                               # AE C% (empty)
+            serial(deadline) if deadline else row["project_deadline_date"],   # AF deadline
+            serial(first_sub),                                                # AG 1st submission date
+            wow_submission(first_sub, deadline),                              # AH WOW Submission
+            month_text(first_sub),                                            # AI Submission month
+            first_sub_txt,                                                    # AJ 1st Submission
+            serial(clear_at),                                                 # AK Clearance Time
+            wow_clearance(clear_at, deadline),                                # AL WOW Clearance
+            month_text(clear_at),                                             # AM Clearance Month
+            clearance_week_sql(row["marks_obtained"], row["latest_feedback_given_time"]),  # AN
+            submission_month_bucket(first_sub, deadline),                     # AO Submission Month
+            clearance_month_bucket_sql(cleared, clear_at, deadline),          # AP Clearance month
+        ]
+        out.append(cols)
+    return pd.DataFrame(out, columns=[f"_h{i}" for i in range(len(SQL_HELPER_HEADERS))], index=raw.index)
